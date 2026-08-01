@@ -1,39 +1,60 @@
-<div align="center" markdown="1">
+# meshkit modem firmware
 
-<img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
-<h1>Meshtastic Firmware</h1>
+This is a modified version of [meshtastic/firmware](https://github.com/meshtastic/firmware).
 
-![GitHub release downloads](https://img.shields.io/github/downloads/meshtastic/firmware/total)
-[![CI](https://img.shields.io/github/actions/workflow/status/meshtastic/firmware/main_matrix.yml?branch=master&label=actions&logo=github&color=yellow)](https://github.com/meshtastic/firmware/actions/workflows/ci.yml)
-[![CLA assistant](https://cla-assistant.io/readme/badge/meshtastic/firmware)](https://cla-assistant.io/meshtastic/firmware)
-[![Fiscal Contributors](https://opencollective.com/meshtastic/tiers/badge.svg?label=Fiscal%20Contributors&color=deeppink)](https://opencollective.com/meshtastic/)
-[![Vercel](https://img.shields.io/static/v1?label=Powered%20by&message=Vercel&style=flat&logo=vercel&color=000000)](https://vercel.com?utm_source=meshtastic&utm_campaign=oss)
+It builds a single target, `rak3172`, as an industrial LoRa mesh modem driven by a host MCU over
+UART. Sensor drivers, fieldbus protocols and application logic live on the host; this firmware owns
+the radio and nothing else.
 
-<a href="https://trendshift.io/repositories/5524" target="_blank"><img src="https://trendshift.io/api/badge/repositories/5524" alt="meshtastic%2Ffirmware | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+Traffic on the air is unchanged and remains readable by existing Meshtastic gateways, apps and
+tooling.
 
-</div>
+## What was changed
 
-</div>
+- Modules with no meaning on a headless industrial modem are excluded.
+- A private UART wire protocol is served on UART1. The host sends values; the firmware builds the
+  mesh messages.
+- CI builds and tests only this target.
 
-<div align="center">
-	<a href="https://meshtastic.org">Website</a>
-	-
-	<a href="https://meshtastic.org/docs/">Documentation</a>
-</div>
+See [variants/stm32/rak3172/platformio.ini](variants/stm32/rak3172/platformio.ini) for the exact
+build configuration.
 
-## Overview
+## Protocol
 
-This repository contains the official device firmware for Meshtastic, an open-source LoRa mesh networking project designed for long-range, low-power communication without relying on internet or cellular infrastructure. The firmware supports various hardware platforms, including ESP32, nRF52, RP2040/RP2350, and Linux-based devices.
+The UART protocol is specified in [meshkit](https://github.com/juanjin-dev/meshkit), under
+Apache-2.0, along with the host libraries. Implement from that specification, not from this source.
 
-Meshtastic enables text messaging, location sharing, and telemetry over a decentralized mesh network, making it ideal for outdoor adventures, emergency preparedness, and remote operations.
+## Building
 
-### Get Started
+```bash
+platformio run -e rak3172
+platformio test -e coverage -f test_modem_frame
+```
 
-- 🔧 **[Building Instructions](https://meshtastic.org/docs/development/firmware/build)** – Learn how to compile the firmware from source.
-- ⚡ **[Flashing Instructions](https://meshtastic.org/docs/getting-started/flashing-firmware/)** – Install or update the firmware on your device.
+Requires [PlatformIO](https://platformio.org/). Output is a single application image in
+`.pio/build/rak3172/`; the STM32WLE5 bootloader lives in ROM and is not part of the build.
 
-Join our community and help improve Meshtastic! 🚀
+## Reflashing
 
-## Stats
+Devices are **not** shipped at RDP Level 2. The ROM bootloader is reachable over UART with BOOT0
+asserted, and over SWD, and it does not verify manufacturer signatures - so any image, including one
+you have modified, can be installed:
 
-![Alt](https://repobeats.axiom.co/api/embed/8025e56c482ec63541593cc5bd322c19d5c0bdcf.svg "Repobeats analytics image")
+```bash
+# Assert BOOT0, pulse NRST to enter the ROM bootloader, then:
+stm32flash -w .pio/build/rak3172/firmware-rak3172-*.bin -v -g 0x08000000 /dev/ttyUSB0
+
+# or over SWD with a CMSIS-DAP adapter
+platformio run -e rak3172 -t upload
+```
+
+## Licence
+
+GPL-3.0, inherited from upstream. See [LICENSE](LICENSE).
+
+Bug reports and features that are not specific to this modem belong upstream at
+[meshtastic/firmware](https://github.com/meshtastic/firmware).
+
+Meshtastic® is a registered trademark of Meshtastic LLC. See the
+[trademark policy](https://meshtastic.org/docs/legal/). This project is not affiliated with or
+endorsed by Meshtastic LLC.

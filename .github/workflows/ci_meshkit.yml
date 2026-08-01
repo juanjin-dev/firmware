@@ -1,0 +1,120 @@
+name: CI meshkit
+
+concurrency:
+  group: meshkit-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - meshkit-*
+    paths-ignore:
+      - "**.md"
+      - version.properties
+  pull_request:
+    branches:
+      - meshkit-*
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: rak3172
+            ram_limit: 65536
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-base
+
+      - name: Read the application region size
+        run: |
+          set -euo pipefail
+          ini=$(grep -rl "^\[env:${{ matrix.env }}\]" variants/)
+          app=$(grep -oP '(?<=^board_upload\.maximum_size = )\d+' "$ini")
+          echo "application region: $app bytes"
+          echo "FLASH_LIMIT=$app" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: platformio run -e ${{ matrix.env }} 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tee build.log
+
+      - name: Report size
+        env:
+          RAM_LIMIT: ${{ matrix.ram_limit }}
+        run: |
+          set -euo pipefail
+          flash=$(grep -oP '^Flash:.*used \K\d+' build.log | tail -1)
+          ram=$(grep -oP '^RAM:.*used \K\d+' build.log | tail -1)
+          {
+            echo "### ${{ matrix.env }}"
+            echo "| | used | limit | free |"
+            echo "| --- | ---: | ---: | ---: |"
+            echo "| Flash | $flash | $FLASH_LIMIT | $(( FLASH_LIMIT - flash )) |"
+            echo "| RAM | $ram | $RAM_LIMIT | $(( RAM_LIMIT - ram )) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$flash" -gt "$FLASH_LIMIT" ]; then
+            echo "::error title=Flash overflow::$flash exceeds $FLASH_LIMIT"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: |
+            .pio/build/${{ matrix.env }}/*.bin
+            .pio/build/${{ matrix.env }}/*.hex
+            .pio/build/${{ matrix.env }}/*.elf
+
+  modem-layer-isolation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: src/modem must stay free of Meshtastic types
+        run: |
+          if grep -rnE 'meshtastic_|MeshPacket|NodeDB|pb_(en|de)code|#include "(mesh|modules|graphics)/' src/modem/; then
+            echo "::error title=Layer leak::src/modem is the layer a host implementation mirrors from README.md - it must not depend on Meshtastic"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-native
+
+      - name: Native suites
+        run: platformio test -e coverage --junit-output-path testreport.xml
+
+  check:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [rak3172]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-base
+
+      - name: Static analysis of the modem layer
+        run: platformio check -e ${{ matrix.env }} --pattern src/modem --fail-on-defect=medium --fail-on-defect=high

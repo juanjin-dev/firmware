@@ -3,29 +3,9 @@ concurrency:
   group: ci-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 on:
-  # # Triggers the workflow on push but only for the main branches
-  push:
-    branches:
-      - master
-      - develop
-      - pioarduino # Remove when merged // use `feature/` in the future.
-      - event/*
-      - feature/*
-    paths-ignore:
-      - "**.md"
-      - version.properties
-
-  pull_request:
-    branches:
-      - master
-      - develop
-      - pioarduino # Remove when merged // use `feature/` in the future.
-      - event/*
-      - feature/*
-    paths-ignore:
-      - "**.md"
-      #- "**.yml"
-
+  # This fork ships one board; ci_meshkit.yml is the gate. The upstream
+  # full-board matrix is kept for parity but only runs on demand - dispatch it
+  # to validate a rebase against the whole board set.
   workflow_dispatch:
 
 permissions: read-all

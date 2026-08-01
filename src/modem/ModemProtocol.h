@@ -1,0 +1,157 @@
+#pragma once
+
+/*
+ * Host <-> modem wire protocol definitions. See README.md for the specification.
+ *
+ * Must not depend on Meshtastic types: a host implementation restates these
+ * from the specification, not from this source.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/// Negotiated in HELLO. Governs the meaning of message types and payloads.
+#define MODEM_PROTOCOL_VERSION 1
+
+/// Doubles as the framing generation marker. An incompatible frame layout takes
+/// a new value, and peers built against the old one discard rather than misparse.
+#define MODEM_SOF 0xA5
+
+#define MODEM_MAX_PAYLOAD 512
+#define MODEM_HEADER_SIZE 5
+#define MODEM_CRC_SIZE 2
+#define MODEM_FRAME_OVERHEAD (MODEM_HEADER_SIZE + MODEM_CRC_SIZE)
+#define MODEM_MAX_FRAME_SIZE (MODEM_FRAME_OVERHEAD + MODEM_MAX_PAYLOAD)
+
+#define MODEM_TYPE_RESPONSE_BIT 0x80
+#define MODEM_TYPE_EVENT_BASE 0xC0
+
+typedef enum {
+    MODEM_CMD_EVENT_ACK = 0x00,
+    MODEM_CMD_HELLO = 0x01,
+    MODEM_CMD_GET_MODEM_STATUS = 0x02,
+
+    MODEM_CMD_SET_IDENTITY = 0x10,
+    MODEM_CMD_SET_REGION_PROFILE = 0x11,
+    MODEM_CMD_SET_TX_PARAMS = 0x12,
+    MODEM_CMD_SET_CHANNEL = 0x13,
+    MODEM_CMD_SET_SECURITY = 0x14,
+    MODEM_CMD_SET_RX_POLICY = 0x15,
+    MODEM_CMD_GET_IDENTITY = 0x1E,
+    MODEM_CMD_GET_CONFIG_DIGEST = 0x1F,
+
+    MODEM_CMD_SET_POSITION = 0x20,
+    MODEM_CMD_SEND_TELEMETRY = 0x21,
+    MODEM_CMD_SEND_BINARY = 0x22,
+    MODEM_CMD_SEND_TEXT = 0x23,
+    MODEM_CMD_ANNOUNCE = 0x24,
+
+    MODEM_CMD_GET_MESH_STATUS = 0x30,
+    MODEM_CMD_GET_NODE_LIST = 0x31,
+    MODEM_CMD_GET_NODE_INFO = 0x32,
+
+    MODEM_CMD_ENTER_BOOTLOADER = 0x7F,
+} ModemCommand;
+
+typedef enum {
+    MODEM_EVT_REBOOTED = 0xC0,
+    MODEM_EVT_HEALTH = 0xC1,
+    MODEM_EVT_RX_DATA = 0xC2,
+    MODEM_EVT_RX_TEXT = 0xC3,
+    MODEM_EVT_TX_STATUS = 0xC4,
+    MODEM_EVT_MESH_STATE = 0xC5,
+} ModemEvent;
+
+typedef enum {
+    MODEM_OK = 0x00,
+    MODEM_ERR_UNKNOWN_TYPE = 0x01,
+    MODEM_ERR_BAD_LENGTH = 0x02,
+    MODEM_ERR_BAD_PARAM = 0x03,
+    MODEM_ERR_NOT_HANDSHAKED = 0x04,
+    MODEM_ERR_BUSY = 0x05,
+    MODEM_ERR_TX_QUEUE_FULL = 0x06,
+    MODEM_ERR_NOT_SUPPORTED = 0x07,
+    MODEM_ERR_RADIO = 0x08,
+    MODEM_ERR_STORAGE = 0x09,
+    MODEM_ERR_RATE_LIMITED = 0x0A,
+} ModemStatus;
+
+#define MODEM_T_FRAME_MS 100
+#define MODEM_T_RESPONSE_MS 1000
+/// Separate from MODEM_T_RESPONSE_MS: committing to LittleFS stalls instruction
+/// fetch for an internal flash page erase, which can outlast a transmission.
+#define MODEM_T_RESPONSE_WRITE_MS 3000
+#define MODEM_T_EVENT_ACK_MS 500
+#define MODEM_T_HEALTH_MS 10000
+#define MODEM_T_IDLE_MS 30000
+
+#define MODEM_EVENT_ACK_ATTEMPTS 3
+
+/// A retried command must not execute twice: a repeated SEND_* would otherwise
+/// put the same measurement on the mesh a second time.
+#define MODEM_RESPONSE_CACHE_DEPTH 8
+
+/// Guards ENTER_MODEM_BOOTLOADER, which cannot be undone from the host side.
+#define MODEM_BOOTLOADER_MAGIC 0x1EB00710u
+
+typedef enum {
+    MODEM_REBOOT_POWER_ON = 0,
+    MODEM_REBOOT_RESET_PIN = 1,
+    MODEM_REBOOT_WATCHDOG = 2,
+    MODEM_REBOOT_SOFTWARE = 3,
+    MODEM_REBOOT_BROWNOUT = 4,
+} ModemRebootReason;
+
+typedef enum {
+    MODEM_TEXT_RX_ALL = 0,
+    MODEM_TEXT_RX_ALLOWLIST = 1,
+    MODEM_TEXT_RX_BLOCK = 2,
+} ModemTextRxMode;
+
+typedef enum {
+    MODEM_PORTNUM_ALL = 0,
+    MODEM_PORTNUM_ALLOWLIST = 1,
+} ModemPortnumMode;
+
+typedef enum {
+    MODEM_TX_QUEUED = 0,
+    MODEM_TX_SENT = 1,
+    MODEM_TX_ACKED = 2,
+    MODEM_TX_TIMEOUT = 3,
+    MODEM_TX_FAILED = 4,
+} ModemTxState;
+
+typedef enum {
+    MODEM_STATE_NORMAL = 0,
+    MODEM_STATE_CONGESTED = 1,
+    MODEM_STATE_UNDER_ATTACK = 2,
+    MODEM_STATE_QUARANTINE = 3,
+} ModemHealthState;
+
+static inline bool modemTypeIsCommand(uint8_t type)
+{
+    return type >= 0x01 && type < MODEM_TYPE_RESPONSE_BIT;
+}
+
+static inline bool modemTypeIsResponse(uint8_t type)
+{
+    return type >= MODEM_TYPE_RESPONSE_BIT && type < MODEM_TYPE_EVENT_BASE;
+}
+
+static inline bool modemTypeIsEvent(uint8_t type)
+{
+    return type >= MODEM_TYPE_EVENT_BASE;
+}
+
+/// RX events carry mesh packets already received; lost on the UART they are
+/// gone. State events are recoverable by polling and go unacknowledged.
+static inline bool modemEventNeedsAck(uint8_t type)
+{
+    return type == MODEM_EVT_RX_DATA || type == MODEM_EVT_RX_TEXT;
+}
+
+static inline uint8_t modemResponseFor(uint8_t command)
+{
+    return (uint8_t)(command | MODEM_TYPE_RESPONSE_BIT);
+}

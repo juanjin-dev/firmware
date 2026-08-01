@@ -93,6 +93,9 @@
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_SERIAL
 #include "modules/SerialModule.h"
 #endif
+#if defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_INDUSTRIAL_MODEM
+#include "modules/IndustrialModem/IndustrialModemModule.h"
+#endif
 
 #if !MESHTASTIC_EXCLUDE_DROPZONE
 #include "modules/DropzoneModule.h"
@@ -220,6 +223,9 @@ void setupModules()
         new SerialModule();
     }
 #endif
+#endif
+#if defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_INDUSTRIAL_MODEM
+    industrialModemModule = new IndustrialModemModule();
 #endif
 #ifdef ARCH_ESP32
     // Only run on an esp32 based device.
