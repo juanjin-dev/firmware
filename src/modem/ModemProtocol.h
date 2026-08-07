@@ -25,10 +25,10 @@
 #define MODEM_MAX_FRAME_SIZE (MODEM_FRAME_OVERHEAD + MODEM_MAX_PAYLOAD)
 
 #define MODEM_TYPE_RESPONSE_BIT 0x80
-#define MODEM_TYPE_EVENT_BASE 0xC0
+#define MODEM_TYPE_MODEM_BIT 0x40
+#define MODEM_TYPE_KIND_MASK 0xC0
 
 typedef enum {
-    MODEM_CMD_EVENT_ACK = 0x00,
     MODEM_CMD_HELLO = 0x01,
     MODEM_CMD_GET_MODEM_STATUS = 0x02,
 
@@ -51,16 +51,19 @@ typedef enum {
     MODEM_CMD_GET_NODE_LIST = 0x31,
     MODEM_CMD_GET_NODE_INFO = 0x32,
 
-    MODEM_CMD_ENTER_BOOTLOADER = 0x7F,
+    MODEM_CMD_ENTER_BOOTLOADER = 0x3F,
 } ModemCommand;
 
 typedef enum {
-    MODEM_EVT_REBOOTED = 0xC0,
-    MODEM_EVT_HEALTH = 0xC1,
-    MODEM_EVT_RX_DATA = 0xC2,
-    MODEM_EVT_RX_TEXT = 0xC3,
-    MODEM_EVT_TX_STATUS = 0xC4,
-    MODEM_EVT_MESH_STATE = 0xC5,
+    MODEM_EVT_REBOOTED = 0x40,
+    MODEM_EVT_HEALTH = 0x41,
+    MODEM_EVT_RX_DATA = 0x42,
+    MODEM_EVT_RX_TEXT = 0x43,
+    MODEM_EVT_TX_STATUS = 0x44,
+    MODEM_EVT_MESH_STATE = 0x45,
+
+    MODEM_QRY_TELEMETRY = 0x60,
+    MODEM_QRY_POSITION = 0x61,
 } ModemEvent;
 
 typedef enum {
@@ -85,8 +88,23 @@ typedef enum {
 #define MODEM_T_EVENT_ACK_MS 500
 #define MODEM_T_HEALTH_MS 10000
 #define MODEM_T_IDLE_MS 30000
+#define MODEM_T_QUERY_MS 400
+/// Upper bounds on how long a transmission may sit in one state before the
+/// modem gives up on it and reports a terminal outcome.
+#define MODEM_T_TX_SEND_MS 30000
+#define MODEM_T_TX_ACK_MS 60000
 
 #define MODEM_EVENT_ACK_ATTEMPTS 3
+
+#define MODEM_SEND_WANT_ACK 0x01
+#define MODEM_SEND_WANT_RESPONSE 0x02
+#define MODEM_SEND_PKI 0x04
+
+/// What one mesh frame carries, and what encrypting to a recipient costs out of
+/// it. A payload is refused up front rather than failing after the modem has
+/// already answered that it accepted the send.
+#define MODEM_MAX_MESH_PAYLOAD 233
+#define MODEM_PKI_OVERHEAD 12
 
 /// A retried command must not execute twice: a repeated SEND_* would otherwise
 /// put the same measurement on the mesh a second time.
@@ -131,27 +149,37 @@ typedef enum {
 
 static inline bool modemTypeIsCommand(uint8_t type)
 {
-    return type >= 0x01 && type < MODEM_TYPE_RESPONSE_BIT;
-}
-
-static inline bool modemTypeIsResponse(uint8_t type)
-{
-    return type >= MODEM_TYPE_RESPONSE_BIT && type < MODEM_TYPE_EVENT_BASE;
+    return (type & MODEM_TYPE_KIND_MASK) == 0x00 && type != 0x00;
 }
 
 static inline bool modemTypeIsEvent(uint8_t type)
 {
-    return type >= MODEM_TYPE_EVENT_BASE;
+    return (type & MODEM_TYPE_KIND_MASK) == MODEM_TYPE_MODEM_BIT;
+}
+
+static inline bool modemTypeIsCommandResponse(uint8_t type)
+{
+    return (type & MODEM_TYPE_KIND_MASK) == MODEM_TYPE_RESPONSE_BIT;
+}
+
+static inline bool modemTypeIsHostResponse(uint8_t type)
+{
+    return (type & MODEM_TYPE_KIND_MASK) == MODEM_TYPE_KIND_MASK;
 }
 
 /// RX events carry mesh packets already received; lost on the UART they are
-/// gone. State events are recoverable by polling and go unacknowledged.
+/// gone. State events are recoverable by polling and go unanswered.
 static inline bool modemEventNeedsAck(uint8_t type)
 {
     return type == MODEM_EVT_RX_DATA || type == MODEM_EVT_RX_TEXT;
 }
 
-static inline uint8_t modemResponseFor(uint8_t command)
+static inline uint8_t modemResponseFor(uint8_t request)
 {
-    return (uint8_t)(command | MODEM_TYPE_RESPONSE_BIT);
+    return (uint8_t)(request | MODEM_TYPE_RESPONSE_BIT);
+}
+
+static inline uint8_t modemRequestFor(uint8_t response)
+{
+    return (uint8_t)(response & ~MODEM_TYPE_RESPONSE_BIT);
 }

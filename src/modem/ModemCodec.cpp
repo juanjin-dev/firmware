@@ -170,11 +170,19 @@ bool modemDecodePosition(const uint8_t *buf, uint16_t len, ModemPosition *out)
     out->latitude_i = (int32_t)rd32(&buf[0]);
     out->longitude_i = (int32_t)rd32(&buf[4]);
     out->altitude_m = (int32_t)rd32(&buf[8]);
-    out->timestamp_unix = rd32(&buf[12]);
-    out->precision_bits = buf[16];
-    out->fix_type = buf[17];
-    out->sats_in_view = buf[18];
-    out->flags = buf[19];
+    out->altitude_hae = (int32_t)rd32(&buf[12]);
+    out->timestamp_unix = rd32(&buf[16]);
+    out->ground_speed_mmps = rd32(&buf[20]);
+    out->ground_track = rd32(&buf[24]);
+    out->hdop = rd16(&buf[28]);
+    out->pdop = rd16(&buf[30]);
+    out->gps_accuracy_mm = rd16(&buf[32]);
+    out->precision_bits = buf[34];
+    out->fix_type = buf[35];
+    out->sats_in_view = buf[36];
+    out->loc_source = buf[37];
+    out->alt_source = buf[38];
+    out->flags = buf[39];
     return true;
 }
 
@@ -184,12 +192,19 @@ bool modemDecodeTelemetry(const uint8_t *buf, uint16_t len, ModemTelemetry *out)
         return false;
 
     const uint8_t count = buf[1];
-    if ((uint32_t)len < 2u + (uint32_t)count * 6u)
+    const uint32_t textOffset = 2u + (uint32_t)count * 6u;
+    if ((uint32_t)len < textOffset + 1u)
+        return false;
+
+    const uint8_t text_len = buf[textOffset];
+    if ((uint32_t)len < textOffset + 1u + text_len)
         return false;
 
     out->variant = buf[0];
     out->metric_count = count;
     out->metrics = &buf[2];
+    out->utf8 = &buf[textOffset + 1];
+    out->text_len = text_len;
     return true;
 }
 
@@ -207,19 +222,19 @@ bool modemTelemetryMetric(const ModemTelemetry *telemetry, uint8_t index, ModemM
 
 bool modemDecodeSendBinary(const uint8_t *buf, uint16_t len, ModemSendBinary *out)
 {
-    if (len < 10)
+    if (len < 12)
         return false;
 
-    const uint16_t payload_len = rd16(&buf[8]);
-    if ((uint32_t)len < 10u + payload_len)
+    const uint16_t payload_len = rd16(&buf[10]);
+    if ((uint32_t)len < 12u + payload_len)
         return false;
 
     out->dest_node = rd32(&buf[0]);
-    out->portnum = buf[4];
-    out->flags = buf[5];
-    out->hop_limit = buf[6];
-    out->channel_index = buf[7];
-    out->payload = &buf[10];
+    out->portnum = rd16(&buf[4]);
+    out->flags = buf[6];
+    out->hop_limit = buf[7];
+    out->channel_index = buf[8];
+    out->payload = &buf[12];
     out->payload_len = payload_len;
     return true;
 }
@@ -238,6 +253,56 @@ bool modemDecodeSendText(const uint8_t *buf, uint16_t len, ModemSendText *out)
     out->flags = buf[5];
     out->utf8 = &buf[8];
     out->text_len = text_len;
+    return true;
+}
+
+bool modemIsValidUtf8(const uint8_t *buf, uint16_t len)
+{
+    uint16_t i = 0;
+    while (i < len) {
+        const uint8_t lead = buf[i];
+        uint8_t extra;
+        uint32_t code;
+
+        if (lead <= 0x7F) {
+            i++;
+            continue;
+        } else if ((lead & 0xE0) == 0xC0) {
+            extra = 1;
+            code = lead & 0x1Fu;
+        } else if ((lead & 0xF0) == 0xE0) {
+            extra = 2;
+            code = lead & 0x0Fu;
+        } else if ((lead & 0xF8) == 0xF0) {
+            extra = 3;
+            code = lead & 0x07u;
+        } else {
+            return false;
+        }
+
+        if ((uint32_t)i + 1u + extra > len)
+            return false;
+
+        for (uint8_t k = 1; k <= extra; k++) {
+            const uint8_t next = buf[i + k];
+            if ((next & 0xC0) != 0x80)
+                return false;
+            code = (code << 6) | (next & 0x3Fu);
+        }
+
+        if (extra == 1 && code < 0x80)
+            return false;
+        if (extra == 2 && code < 0x800)
+            return false;
+        if (extra == 3 && code < 0x10000)
+            return false;
+        if (code > 0x10FFFF)
+            return false;
+        if (code >= 0xD800 && code <= 0xDFFF)
+            return false;
+
+        i = (uint16_t)(i + 1u + extra);
+    }
     return true;
 }
 
@@ -500,6 +565,51 @@ bool modemDecodeNodeInfoRequest(const uint8_t *buf, uint16_t len, uint32_t *out_
 
     *out_node_num = rd32(&buf[0]);
     return true;
+}
+
+uint16_t modemEncodeQueryTelemetry(uint8_t *buf, uint16_t cap, uint32_t from_node, uint8_t variant)
+{
+    if (cap < MODEM_QUERY_TELEMETRY_SIZE)
+        return 0;
+
+    wr32(&buf[0], from_node);
+    wr8(&buf[4], variant);
+    buf[5] = buf[6] = buf[7] = 0;
+    return MODEM_QUERY_TELEMETRY_SIZE;
+}
+
+uint16_t modemEncodeQueryPosition(uint8_t *buf, uint16_t cap, uint32_t from_node)
+{
+    if (cap < MODEM_QUERY_POSITION_SIZE)
+        return 0;
+
+    wr32(&buf[0], from_node);
+    buf[4] = buf[5] = buf[6] = buf[7] = 0;
+    return MODEM_QUERY_POSITION_SIZE;
+}
+
+uint16_t modemEncodePosition(uint8_t *buf, uint16_t cap, const ModemPosition *in)
+{
+    if (cap < MODEM_POSITION_SIZE)
+        return 0;
+
+    wr32(&buf[0], (uint32_t)in->latitude_i);
+    wr32(&buf[4], (uint32_t)in->longitude_i);
+    wr32(&buf[8], (uint32_t)in->altitude_m);
+    wr32(&buf[12], (uint32_t)in->altitude_hae);
+    wr32(&buf[16], in->timestamp_unix);
+    wr32(&buf[20], in->ground_speed_mmps);
+    wr32(&buf[24], in->ground_track);
+    wr16(&buf[28], in->hdop);
+    wr16(&buf[30], in->pdop);
+    wr16(&buf[32], in->gps_accuracy_mm);
+    wr8(&buf[34], in->precision_bits);
+    wr8(&buf[35], in->fix_type);
+    wr8(&buf[36], in->sats_in_view);
+    wr8(&buf[37], in->loc_source);
+    wr8(&buf[38], in->alt_source);
+    wr8(&buf[39], in->flags);
+    return MODEM_POSITION_SIZE;
 }
 
 uint16_t modemEncodeBadParam(uint8_t *buf, uint16_t cap, uint8_t field_offset)

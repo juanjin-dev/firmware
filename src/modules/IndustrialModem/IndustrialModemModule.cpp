@@ -2,6 +2,7 @@
 
 #include "Channels.h"
 #include "MeshService.h"
+#include "HardwareRNG.h"
 #include "RadioLibInterface.h"
 #include "Router.h"
 #include "NodeDB.h"
@@ -9,6 +10,7 @@
 #include "modules/NodeInfoModule.h"
 #include "main.h"
 #include "TypeConversions.h"
+#include "RTC.h"
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
 #include <math.h>
@@ -28,13 +30,21 @@ IndustrialModemModule *industrialModemModule;
 /// elsewhere.
 #define MODEM_SERVICE_MS 5
 
-IndustrialModemModule::IndustrialModemModule() : concurrency::OSThread("IndustrialModem") {}
+IndustrialModemModule::IndustrialModemModule() : MeshModule("IndustrialModem"), concurrency::OSThread("IndustrialModem") {}
 
 int32_t IndustrialModemModule::runOnce()
 {
     if (!started) {
         MODEM_UART.begin(MODEM_BAUD);
         decoder.reset();
+
+        // Seeded here rather than in platform setup because the entropy comes from
+        // the radio's wideband noise, and the radio is not up until setup returns.
+        uint32_t entropy = 0;
+        if (!HardwareRNG::seed(entropy))
+            entropy = micros();
+        randomSeed(entropy);
+
         sessionEpoch = random(1, INT32_MAX);
         started = true;
 
@@ -51,7 +61,144 @@ int32_t IndustrialModemModule::runOnce()
     }
 
     service();
+    expirePendingTx();
+    expirePendingQuery();
     return MODEM_SERVICE_MS;
+}
+
+bool IndustrialModemModule::wantPacket(const meshtastic_MeshPacket *p)
+{
+    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag)
+        return false;
+
+    return p->decoded.portnum == meshtastic_PortNum_ROUTING_APP ||
+           p->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP ||
+           p->decoded.portnum == meshtastic_PortNum_POSITION_APP;
+}
+
+ProcessMessage IndustrialModemModule::handleReceived(const meshtastic_MeshPacket &mp)
+{
+    if (mp.decoded.portnum == meshtastic_PortNum_ROUTING_APP)
+        onRouting(mp);
+    else if (mp.decoded.portnum == meshtastic_PortNum_TELEMETRY_APP)
+        recordPeerTelemetry(mp);
+    return ProcessMessage::CONTINUE;
+}
+
+void IndustrialModemModule::recordPeerTelemetry(const meshtastic_MeshPacket &mp)
+{
+    if (!nodeDB)
+        return;
+
+    meshtastic_Telemetry heard = meshtastic_Telemetry_init_default;
+    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Telemetry_msg, &heard))
+        return;
+    if (heard.which_variant != meshtastic_Telemetry_device_metrics_tag)
+        return;
+
+    nodeDB->updateTelemetry(getFrom(&mp), heard, RX_SRC_RADIO);
+}
+
+void IndustrialModemModule::onRouting(const meshtastic_MeshPacket &mp)
+{
+    const uint32_t id = mp.decoded.request_id;
+    if (!id)
+        return;
+
+    meshtastic_Routing routing = meshtastic_Routing_init_default;
+    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Routing_msg, &routing))
+        return;
+
+    const uint8_t hopsUsed = mp.hop_start >= mp.hop_limit ? (uint8_t)(mp.hop_start - mp.hop_limit) : 0;
+
+    switch (routing.error_reason) {
+    case meshtastic_Routing_Error_NONE:
+        completeTx(id, MODEM_TX_ACKED, 0, hopsUsed);
+        break;
+    case meshtastic_Routing_Error_MAX_RETRANSMIT:
+        completeTx(id, MODEM_TX_TIMEOUT, (uint8_t)routing.error_reason, hopsUsed);
+        break;
+    default:
+        completeTx(id, MODEM_TX_FAILED, (uint8_t)routing.error_reason, hopsUsed);
+        break;
+    }
+}
+
+void IndustrialModemModule::trackTx(uint32_t id, bool wantAck)
+{
+    PendingTx *slot = nullptr;
+    for (uint8_t i = 0; i < MODEM_MAX_PENDING_TX; i++) {
+        if (!pending[i].id) {
+            slot = &pending[i];
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &pending[0];
+        for (uint8_t i = 1; i < MODEM_MAX_PENDING_TX; i++)
+            if (pending[i].expiresAt < slot->expiresAt)
+                slot = &pending[i];
+    }
+
+    slot->id = id;
+    slot->wantAck = wantAck;
+    slot->state = MODEM_TX_QUEUED;
+    slot->expiresAt = millis() + (wantAck ? MODEM_T_TX_ACK_MS : MODEM_T_TX_SEND_MS);
+    emitTxStatus(id, MODEM_TX_QUEUED, 0, 0);
+}
+
+void IndustrialModemModule::completeTx(uint32_t id, uint8_t state, uint8_t err, uint8_t hopsUsed)
+{
+    for (uint8_t i = 0; i < MODEM_MAX_PENDING_TX; i++) {
+        if (pending[i].id != id)
+            continue;
+        pending[i].id = 0;
+        emitTxStatus(id, state, err, hopsUsed);
+        return;
+    }
+}
+
+void IndustrialModemModule::expirePendingTx()
+{
+    if (!nodeDB)
+        return;
+
+    const uint32_t now = millis();
+    const uint32_t self = nodeDB->getNodeNum();
+
+    for (uint8_t i = 0; i < MODEM_MAX_PENDING_TX; i++) {
+        PendingTx &tx = pending[i];
+        if (!tx.id)
+            continue;
+
+        if (tx.state == MODEM_TX_QUEUED && RadioLibInterface::instance &&
+            !RadioLibInterface::instance->isTxPending(self, tx.id)) {
+            tx.state = MODEM_TX_SENT;
+            emitTxStatus(tx.id, MODEM_TX_SENT, 0, 0);
+            if (!tx.wantAck) {
+                tx.id = 0;
+                continue;
+            }
+        }
+
+        if ((int32_t)(now - tx.expiresAt) >= 0) {
+            const uint32_t id = tx.id;
+            tx.id = 0;
+            emitTxStatus(id, MODEM_TX_TIMEOUT, 0, 0);
+        }
+    }
+}
+
+void IndustrialModemModule::emitTxStatus(uint32_t id, uint8_t state, uint8_t err, uint8_t hopsUsed)
+{
+    ModemTxStatus status = {};
+    status.tx_id = id;
+    status.state = state;
+    status.err = err;
+    status.hops_used = hopsUsed;
+
+    uint8_t payload[MODEM_TX_STATUS_SIZE];
+    emit(MODEM_EVT_TX_STATUS, payload, modemEncodeTxStatus(payload, sizeof(payload), &status));
 }
 
 void IndustrialModemModule::service()
@@ -92,16 +239,55 @@ void IndustrialModemModule::service()
 
 void IndustrialModemModule::onFrame(const ModemFrameView &frame)
 {
-    if (modemTypeIsCommand(frame.type) || frame.type == MODEM_CMD_EVENT_ACK)
+    if (modemTypeIsCommand(frame.type))
         onCommand(frame);
-    // Responses and events are the modem's to send, never to receive.
+    else if (modemTypeIsHostResponse(frame.type))
+        onHostResponse(frame);
+    // Command responses and modem-initiated frames are ours to send, never to receive.
+}
+
+void IndustrialModemModule::onHostResponse(const ModemFrameView &frame)
+{
+    const uint8_t asked = modemRequestFor(frame.type);
+    if (asked != MODEM_QRY_TELEMETRY && asked != MODEM_QRY_POSITION)
+        return;
+    if (frame.seq != querySeq || !queryPending)
+        return;
+
+    queryPending = false;
+    if (frame.payloadLen < 1 || frame.payload[0] != MODEM_OK)
+        return;
+
+    if (asked == MODEM_QRY_POSITION) {
+        ModemPosition fresh;
+        if (!modemDecodePosition(&frame.payload[1], (uint16_t)(frame.payloadLen - 1), &fresh))
+            return;
+
+        lastPosition = fresh;
+        havePosition = true;
+
+        uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+        answerPendingQuery(encoded, encodePosition(fresh, encoded, sizeof(encoded)));
+        return;
+    }
+
+    ModemTelemetry answer;
+    if (!modemDecodeTelemetry(&frame.payload[1], (uint16_t)(frame.payloadLen - 1), &answer))
+        return;
+    if (answer.variant != query.variant)
+        return;
+
+    uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+    const uint16_t len = encodeTelemetry(answer, encoded, sizeof(encoded));
+    if (!len)
+        return;
+
+    cacheTelemetry(answer.variant, encoded, len);
+    answerPendingQuery(encoded, len);
 }
 
 void IndustrialModemModule::onCommand(const ModemFrameView &frame)
 {
-    if (frame.type == MODEM_CMD_EVENT_ACK)
-        return; // No data events are emitted yet, so nothing to retire.
-
     // Every command except HELLO is refused until the handshake completes, so a
     // frame from an unknown peer version can never reach a handler.
     if (!handshaked && frame.type != MODEM_CMD_HELLO) {
@@ -249,6 +435,42 @@ void IndustrialModemModule::onCommand(const ModemFrameView &frame)
             return;
         }
         replyStatus(frame.type, frame.seq, sendPosition(position));
+        break;
+    }
+
+    case MODEM_CMD_SEND_TELEMETRY: {
+        ModemTelemetry telemetry;
+        if (!modemDecodeTelemetry(frame.payload, frame.payloadLen, &telemetry)) {
+            replyStatus(frame.type, frame.seq, MODEM_ERR_BAD_LENGTH);
+            return;
+        }
+        uint32_t txId = 0;
+        const uint8_t status = sendTelemetry(telemetry, &txId);
+        reply(frame.type, frame.seq, scratch, modemEncodeSendReply(scratch, sizeof(scratch), status, txId));
+        break;
+    }
+
+    case MODEM_CMD_SEND_BINARY: {
+        ModemSendBinary message;
+        if (!modemDecodeSendBinary(frame.payload, frame.payloadLen, &message)) {
+            replyStatus(frame.type, frame.seq, MODEM_ERR_BAD_LENGTH);
+            return;
+        }
+        uint32_t txId = 0;
+        const uint8_t status = sendBinary(message, &txId);
+        reply(frame.type, frame.seq, scratch, modemEncodeSendReply(scratch, sizeof(scratch), status, txId));
+        break;
+    }
+
+    case MODEM_CMD_SEND_TEXT: {
+        ModemSendText message;
+        if (!modemDecodeSendText(frame.payload, frame.payloadLen, &message)) {
+            replyStatus(frame.type, frame.seq, MODEM_ERR_BAD_LENGTH);
+            return;
+        }
+        uint32_t txId = 0;
+        const uint8_t status = sendText(message, &txId);
+        reply(frame.type, frame.seq, scratch, modemEncodeSendReply(scratch, sizeof(scratch), status, txId));
         break;
     }
 
@@ -444,11 +666,653 @@ uint8_t IndustrialModemModule::setIdentity(const ModemIdentity &in)
     return MODEM_OK;
 }
 
-uint8_t IndustrialModemModule::sendPosition(const ModemPosition &in)
+static uint8_t telemetryVariantForTag(pb_size_t tag)
+{
+    switch (tag) {
+    case meshtastic_Telemetry_device_metrics_tag:
+        return 1;
+    case meshtastic_Telemetry_environment_metrics_tag:
+        return 2;
+    case meshtastic_Telemetry_power_metrics_tag:
+        return 3;
+    case meshtastic_Telemetry_air_quality_metrics_tag:
+        return 5;
+    case meshtastic_Telemetry_host_metrics_tag:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+void IndustrialModemModule::cacheTelemetry(uint8_t variant, const uint8_t *payload, uint16_t len)
+{
+    if (len > sizeof(telemetry[0].payload))
+        return;
+
+    TelemetrySlot *slot = nullptr;
+    for (uint8_t i = 0; i < MODEM_TELEMETRY_SLOTS; i++) {
+        if (telemetry[i].variant == variant || telemetry[i].variant == 0) {
+            slot = &telemetry[i];
+            break;
+        }
+    }
+    if (!slot)
+        return;
+
+    memcpy(slot->payload, payload, len);
+    slot->len = len;
+    slot->variant = variant;
+}
+
+const IndustrialModemModule::TelemetrySlot *IndustrialModemModule::cachedTelemetry(uint8_t variant) const
+{
+    for (uint8_t i = 0; i < MODEM_TELEMETRY_SLOTS; i++)
+        if (telemetry[i].variant == variant && telemetry[i].len)
+            return &telemetry[i];
+    return nullptr;
+}
+
+meshtastic_MeshPacket *IndustrialModemModule::allocReply()
+{
+    if (!currentRequest || !router || query.active)
+        return nullptr;
+
+    const meshtastic_MeshPacket &request = *currentRequest;
+
+    // The reading belongs to the host, so ask it. Answering here would block the
+    // receive path for a UART round trip; the reply goes out later, correlated by
+    // request id, and the mesh is told to expect nothing from this call.
+    if (request.decoded.portnum == meshtastic_PortNum_TELEMETRY_APP)
+        return replyToTelemetryRequest(request);
+    if (request.decoded.portnum == meshtastic_PortNum_POSITION_APP)
+        return replyToPositionRequest(request);
+    return nullptr;
+}
+
+meshtastic_MeshPacket *IndustrialModemModule::replyToTelemetryRequest(const meshtastic_MeshPacket &request)
+{
+    meshtastic_Telemetry asked = meshtastic_Telemetry_init_default;
+    if (!pb_decode_from_bytes(request.decoded.payload.bytes, request.decoded.payload.size, &meshtastic_Telemetry_msg,
+                              &asked))
+        return nullptr;
+
+    const uint8_t variant = telemetryVariantForTag(asked.which_variant);
+    if (!variant)
+        return nullptr;
+
+    askHost(MODEM_QRY_TELEMETRY, request, variant);
+    ignoreRequest = true;
+    return nullptr;
+}
+
+meshtastic_MeshPacket *IndustrialModemModule::replyToPositionRequest(const meshtastic_MeshPacket &request)
+{
+    askHost(MODEM_QRY_POSITION, request, 0);
+    ignoreRequest = true;
+    return nullptr;
+}
+
+void IndustrialModemModule::askHost(uint8_t queryType, const meshtastic_MeshPacket &request, uint8_t variant)
+{
+    query.from = getFrom(&request);
+    query.requestId = request.id;
+    query.channel = request.channel;
+    query.type = queryType;
+    query.variant = variant;
+    query.deadline = millis() + MODEM_T_QUERY_MS;
+    query.active = true;
+
+    uint8_t payload[MODEM_QUERY_TELEMETRY_SIZE];
+    const uint16_t len = queryType == MODEM_QRY_POSITION
+                             ? modemEncodeQueryPosition(payload, sizeof(payload), query.from)
+                             : modemEncodeQueryTelemetry(payload, sizeof(payload), query.from, variant);
+    querySeq = eventSeq;
+    queryPending = true;
+    emit(queryType, payload, len);
+}
+
+void IndustrialModemModule::answerPendingQuery(const uint8_t *payload, uint16_t len)
+{
+    if (!query.active)
+        return;
+    query.active = false;
+    queryPending = false;
+
+    if (!router || !::service || !len)
+        return;
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return;
+
+    p->to = query.from;
+    p->channel = query.channel;
+    p->decoded.portnum = meshtastic_PortNum_TELEMETRY_APP;
+    p->decoded.request_id = query.requestId;
+    memcpy(p->decoded.payload.bytes, payload, len);
+    p->decoded.payload.size = len;
+    ::service->sendToMesh(p, RX_SRC_LOCAL, true);
+}
+
+void IndustrialModemModule::expirePendingQuery()
+{
+    if (!query.active || (int32_t)(millis() - query.deadline) < 0)
+        return;
+
+    if (query.type == MODEM_QRY_POSITION) {
+        uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+        const uint16_t len = havePosition ? encodePosition(lastPosition, encoded, sizeof(encoded)) : 0;
+        answerPendingQuery(encoded, len);
+        return;
+    }
+
+    // Device metrics describe the radio, so the modem can always answer them even
+    // when the host declines to add the battery and rail voltage it alone knows.
+    if (query.variant == 1) {
+        ModemTelemetry own = {};
+        own.variant = 1;
+        uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+        answerPendingQuery(encoded, encodeTelemetry(own, encoded, sizeof(encoded)));
+        return;
+    }
+
+    const TelemetrySlot *slot = cachedTelemetry(query.variant);
+    if (slot)
+        answerPendingQuery(slot->payload, slot->len);
+    else
+        answerPendingQuery(nullptr, 0);
+}
+
+static bool applyDeviceMetric(meshtastic_DeviceMetrics *out, uint8_t id, float v)
+{
+    switch (id) {
+    case 1:
+        out->battery_level = (uint32_t)lroundf(v);
+        out->has_battery_level = true;
+        return true;
+    case 2:
+        out->voltage = v;
+        out->has_voltage = true;
+        return true;
+    case 3:
+        out->channel_utilization = v;
+        out->has_channel_utilization = true;
+        return true;
+    case 4:
+        out->air_util_tx = v;
+        out->has_air_util_tx = true;
+        return true;
+    case 5:
+        out->uptime_seconds = (uint32_t)lroundf(v);
+        out->has_uptime_seconds = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool applyEnvironmentMetric(meshtastic_EnvironmentMetrics *out, uint8_t id, float v)
+{
+    switch (id) {
+    case 1:
+        out->temperature = v;
+        out->has_temperature = true;
+        return true;
+    case 2:
+        out->relative_humidity = v;
+        out->has_relative_humidity = true;
+        return true;
+    case 3:
+        out->barometric_pressure = v;
+        out->has_barometric_pressure = true;
+        return true;
+    case 4:
+        out->gas_resistance = v;
+        out->has_gas_resistance = true;
+        return true;
+    case 5:
+        out->voltage = v;
+        out->has_voltage = true;
+        return true;
+    case 6:
+        out->current = v;
+        out->has_current = true;
+        return true;
+    case 7:
+        out->iaq = (uint16_t)lroundf(v);
+        out->has_iaq = true;
+        return true;
+    case 8:
+        out->distance = v;
+        out->has_distance = true;
+        return true;
+    case 9:
+        out->lux = v;
+        out->has_lux = true;
+        return true;
+    case 10:
+        out->white_lux = v;
+        out->has_white_lux = true;
+        return true;
+    case 11:
+        out->ir_lux = v;
+        out->has_ir_lux = true;
+        return true;
+    case 12:
+        out->uv_lux = v;
+        out->has_uv_lux = true;
+        return true;
+    case 13:
+        out->wind_direction = (uint16_t)lroundf(v);
+        out->has_wind_direction = true;
+        return true;
+    case 14:
+        out->wind_speed = v;
+        out->has_wind_speed = true;
+        return true;
+    case 15:
+        out->weight = v;
+        out->has_weight = true;
+        return true;
+    case 16:
+        out->wind_gust = v;
+        out->has_wind_gust = true;
+        return true;
+    case 17:
+        out->wind_lull = v;
+        out->has_wind_lull = true;
+        return true;
+    case 18:
+        out->radiation = v;
+        out->has_radiation = true;
+        return true;
+    case 19:
+        out->rainfall_1h = v;
+        out->has_rainfall_1h = true;
+        return true;
+    case 20:
+        out->rainfall_24h = v;
+        out->has_rainfall_24h = true;
+        return true;
+    case 21:
+        out->soil_moisture = (uint8_t)lroundf(v);
+        out->has_soil_moisture = true;
+        return true;
+    case 22:
+        out->soil_temperature = v;
+        out->has_soil_temperature = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool applyPowerMetric(meshtastic_PowerMetrics *out, uint8_t id, float v)
+{
+    if (id < 1 || id > 16)
+        return false;
+
+    float *voltages[] = {&out->ch1_voltage, &out->ch2_voltage, &out->ch3_voltage, &out->ch4_voltage,
+                         &out->ch5_voltage, &out->ch6_voltage, &out->ch7_voltage, &out->ch8_voltage};
+    float *currents[] = {&out->ch1_current, &out->ch2_current, &out->ch3_current, &out->ch4_current,
+                         &out->ch5_current, &out->ch6_current, &out->ch7_current, &out->ch8_current};
+    bool *hasVoltage[] = {&out->has_ch1_voltage, &out->has_ch2_voltage, &out->has_ch3_voltage, &out->has_ch4_voltage,
+                          &out->has_ch5_voltage, &out->has_ch6_voltage, &out->has_ch7_voltage, &out->has_ch8_voltage};
+    bool *hasCurrent[] = {&out->has_ch1_current, &out->has_ch2_current, &out->has_ch3_current, &out->has_ch4_current,
+                          &out->has_ch5_current, &out->has_ch6_current, &out->has_ch7_current, &out->has_ch8_current};
+
+    const uint8_t channel = (uint8_t)((id - 1) / 2);
+    if (id & 1) {
+        *voltages[channel] = v;
+        *hasVoltage[channel] = true;
+    } else {
+        *currents[channel] = v;
+        *hasCurrent[channel] = true;
+    }
+    return true;
+}
+
+static bool applyAirQualityMetric(meshtastic_AirQualityMetrics *out, uint8_t id, float v)
+{
+    const uint32_t whole = (uint32_t)lroundf(v);
+    switch (id) {
+    case 1:
+        out->pm10_standard = whole;
+        out->has_pm10_standard = true;
+        return true;
+    case 2:
+        out->pm25_standard = whole;
+        out->has_pm25_standard = true;
+        return true;
+    case 3:
+        out->pm40_standard = whole;
+        out->has_pm40_standard = true;
+        return true;
+    case 4:
+        out->pm100_standard = whole;
+        out->has_pm100_standard = true;
+        return true;
+    case 5:
+        out->pm10_environmental = whole;
+        out->has_pm10_environmental = true;
+        return true;
+    case 6:
+        out->pm25_environmental = whole;
+        out->has_pm25_environmental = true;
+        return true;
+    case 7:
+        out->pm100_environmental = whole;
+        out->has_pm100_environmental = true;
+        return true;
+    case 8:
+        out->particles_03um = whole;
+        out->has_particles_03um = true;
+        return true;
+    case 9:
+        out->particles_05um = whole;
+        out->has_particles_05um = true;
+        return true;
+    case 10:
+        out->particles_10um = whole;
+        out->has_particles_10um = true;
+        return true;
+    case 11:
+        out->particles_25um = whole;
+        out->has_particles_25um = true;
+        return true;
+    case 12:
+        out->particles_40um = whole;
+        out->has_particles_40um = true;
+        return true;
+    case 13:
+        out->particles_50um = whole;
+        out->has_particles_50um = true;
+        return true;
+    case 14:
+        out->particles_100um = whole;
+        out->has_particles_100um = true;
+        return true;
+    case 15:
+        out->particles_tps = v;
+        out->has_particles_tps = true;
+        return true;
+    case 16:
+        out->co2 = whole;
+        out->has_co2 = true;
+        return true;
+    case 17:
+        out->co2_temperature = v;
+        out->has_co2_temperature = true;
+        return true;
+    case 18:
+        out->co2_humidity = v;
+        out->has_co2_humidity = true;
+        return true;
+    case 19:
+        out->form_formaldehyde = v;
+        out->has_form_formaldehyde = true;
+        return true;
+    case 20:
+        out->form_temperature = v;
+        out->has_form_temperature = true;
+        return true;
+    case 21:
+        out->form_humidity = v;
+        out->has_form_humidity = true;
+        return true;
+    case 22:
+        out->pm_temperature = v;
+        out->has_pm_temperature = true;
+        return true;
+    case 23:
+        out->pm_humidity = v;
+        out->has_pm_humidity = true;
+        return true;
+    case 24:
+        out->pm_voc_idx = v;
+        out->has_pm_voc_idx = true;
+        return true;
+    case 25:
+        out->pm_nox_idx = v;
+        out->has_pm_nox_idx = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool applyHostMetric(meshtastic_HostMetrics *out, uint8_t id, float v)
+{
+    switch (id) {
+    case 1:
+        out->uptime_seconds = (uint32_t)llroundf(v);
+        return true;
+    case 2:
+        out->freemem_bytes = (uint64_t)llroundf(v);
+        return true;
+    case 3:
+        out->diskfree1_bytes = (uint64_t)llroundf(v);
+        return true;
+    case 4:
+        out->diskfree2_bytes = (uint64_t)llroundf(v);
+        out->has_diskfree2_bytes = true;
+        return true;
+    case 5:
+        out->diskfree3_bytes = (uint64_t)llroundf(v);
+        out->has_diskfree3_bytes = true;
+        return true;
+    case 6:
+        out->load1 = (uint16_t)lroundf(v * 100.0f);
+        return true;
+    case 7:
+        out->load5 = (uint16_t)lroundf(v * 100.0f);
+        return true;
+    case 8:
+        out->load15 = (uint16_t)lroundf(v * 100.0f);
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint16_t IndustrialModemModule::encodeTelemetry(const ModemTelemetry &in, uint8_t *out, uint16_t cap)
+{
+    meshtastic_Telemetry telemetry = meshtastic_Telemetry_init_default;
+    switch (in.variant) {
+    case 1:
+        telemetry.which_variant = meshtastic_Telemetry_device_metrics_tag;
+        break;
+    case 2:
+        telemetry.which_variant = meshtastic_Telemetry_environment_metrics_tag;
+        break;
+    case 3:
+        telemetry.which_variant = meshtastic_Telemetry_power_metrics_tag;
+        break;
+    case 5:
+        telemetry.which_variant = meshtastic_Telemetry_air_quality_metrics_tag;
+        break;
+    case 6:
+        telemetry.which_variant = meshtastic_Telemetry_host_metrics_tag;
+        break;
+    default:
+        return 0;
+    }
+
+    if (in.variant == 1) {
+        meshtastic_DeviceMetrics &device = telemetry.variant.device_metrics;
+        device.uptime_seconds = millis() / 1000u;
+        device.has_uptime_seconds = true;
+        if (airTime) {
+            device.channel_utilization = airTime->channelUtilizationPercent();
+            device.has_channel_utilization = true;
+            device.air_util_tx = airTime->utilizationTXPercent();
+            device.has_air_util_tx = true;
+        }
+    }
+
+    if (in.text_len && in.variant != 6)
+        return 0;
+    if (in.text_len >= sizeof(telemetry.variant.host_metrics.user_string))
+        return 0;
+    if (in.text_len && !modemIsValidUtf8(in.utf8, in.text_len))
+        return 0;
+
+    for (uint8_t i = 0; i < in.metric_count; i++) {
+        ModemMetric metric;
+        if (!modemTelemetryMetric(&in, i, &metric))
+            return 0;
+
+        const float value = (float)metric.value * powf(10.0f, (float)metric.scale10);
+        bool applied = false;
+        switch (in.variant) {
+        case 1:
+            applied = applyDeviceMetric(&telemetry.variant.device_metrics, metric.metric_id, value);
+            break;
+        case 2:
+            applied = applyEnvironmentMetric(&telemetry.variant.environment_metrics, metric.metric_id, value);
+            break;
+        case 3:
+            applied = applyPowerMetric(&telemetry.variant.power_metrics, metric.metric_id, value);
+            break;
+        case 5:
+            applied = applyAirQualityMetric(&telemetry.variant.air_quality_metrics, metric.metric_id, value);
+            break;
+        default:
+            applied = applyHostMetric(&telemetry.variant.host_metrics, metric.metric_id, value);
+            break;
+        }
+        if (!applied)
+            return 0;
+    }
+
+    if (in.text_len) {
+        memcpy(telemetry.variant.host_metrics.user_string, in.utf8, in.text_len);
+        telemetry.variant.host_metrics.user_string[in.text_len] = '\0';
+        telemetry.variant.host_metrics.has_user_string = true;
+    }
+
+    telemetry.time = getValidTime(RTCQualityFromNet);
+
+    return (uint16_t)pb_encode_to_bytes(out, cap, &meshtastic_Telemetry_msg, &telemetry);
+}
+
+uint8_t IndustrialModemModule::sendTelemetry(const ModemTelemetry &in, uint32_t *outTxId)
+{
+    if (!router || !::service)
+        return MODEM_ERR_BUSY;
+
+    uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+    const uint16_t len = encodeTelemetry(in, encoded, sizeof(encoded));
+    if (!len)
+        return MODEM_ERR_BAD_PARAM;
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return MODEM_ERR_TX_QUEUE_FULL;
+
+    p->to = NODENUM_BROADCAST;
+    p->decoded.portnum = meshtastic_PortNum_TELEMETRY_APP;
+    memcpy(p->decoded.payload.bytes, encoded, len);
+    p->decoded.payload.size = len;
+    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+
+    cacheTelemetry(in.variant, encoded, len);
+
+    *outTxId = p->id;
+    trackTx(p->id, false);
+    ::service->sendToMesh(p, RX_SRC_LOCAL, true);
+    return MODEM_OK;
+}
+
+static bool portnumIsReservedForModem(uint16_t portnum)
+{
+    switch (portnum) {
+    case meshtastic_PortNum_TEXT_MESSAGE_APP:
+    case meshtastic_PortNum_POSITION_APP:
+    case meshtastic_PortNum_NODEINFO_APP:
+    case meshtastic_PortNum_ROUTING_APP:
+    case meshtastic_PortNum_ADMIN_APP:
+    case meshtastic_PortNum_TELEMETRY_APP:
+    case meshtastic_PortNum_TRACEROUTE_APP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint8_t IndustrialModemModule::sendPayload(uint32_t dest, uint16_t portnum, uint8_t flags, uint8_t hopLimit,
+                                           uint8_t channelIndex, const uint8_t *payload, uint16_t payloadLen,
+                                           uint32_t *outTxId)
 {
     if (!router || !::service || !nodeDB)
         return MODEM_ERR_BUSY;
 
+    const bool wantAck = (flags & MODEM_SEND_WANT_ACK) != 0;
+    const bool wantResponse = (flags & MODEM_SEND_WANT_RESPONSE) != 0;
+    const bool pki = (flags & MODEM_SEND_PKI) != 0;
+    const bool broadcast = dest == NODENUM_BROADCAST;
+
+    if (portnum == 0 || portnum > _meshtastic_PortNum_MAX)
+        return MODEM_ERR_BAD_PARAM;
+    if (channelIndex >= channels.getNumChannels())
+        return MODEM_ERR_BAD_PARAM;
+    if (broadcast && (wantAck || wantResponse))
+        return MODEM_ERR_BAD_PARAM;
+
+    const uint16_t ceiling = pki ? MODEM_MAX_MESH_PAYLOAD - MODEM_PKI_OVERHEAD : MODEM_MAX_MESH_PAYLOAD;
+    if (payloadLen > ceiling)
+        return MODEM_ERR_BAD_PARAM;
+
+    if (pki) {
+        if (broadcast || config.security.private_key.size != 32)
+            return MODEM_ERR_NOT_SUPPORTED;
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(dest);
+        if (!node || node->user.public_key.size != 32)
+            return MODEM_ERR_BAD_PARAM;
+    }
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return MODEM_ERR_TX_QUEUE_FULL;
+
+    p->to = dest;
+    p->channel = channelIndex;
+    p->want_ack = wantAck;
+    p->pki_encrypted = pki;
+    p->decoded.portnum = (meshtastic_PortNum)portnum;
+    p->decoded.want_response = wantResponse;
+    p->decoded.payload.size = payloadLen;
+    memcpy(p->decoded.payload.bytes, payload, payloadLen);
+    if (hopLimit)
+        p->hop_limit = hopLimit;
+    p->priority = wantAck ? meshtastic_MeshPacket_Priority_RELIABLE : meshtastic_MeshPacket_Priority_DEFAULT;
+
+    *outTxId = p->id;
+    trackTx(p->id, wantAck);
+    ::service->sendToMesh(p, RX_SRC_LOCAL, true);
+    return MODEM_OK;
+}
+
+uint8_t IndustrialModemModule::sendBinary(const ModemSendBinary &in, uint32_t *outTxId)
+{
+    if (portnumIsReservedForModem(in.portnum))
+        return MODEM_ERR_NOT_SUPPORTED;
+
+    return sendPayload(in.dest_node, in.portnum, in.flags, in.hop_limit, in.channel_index, in.payload, in.payload_len,
+                       outTxId);
+}
+
+uint8_t IndustrialModemModule::sendText(const ModemSendText &in, uint32_t *outTxId)
+{
+    if (!modemIsValidUtf8(in.utf8, in.text_len))
+        return MODEM_ERR_BAD_PARAM;
+
+    return sendPayload(in.dest_node, meshtastic_PortNum_TEXT_MESSAGE_APP, in.flags, 0, in.channel_index, in.utf8,
+                       in.text_len, outTxId);
+}
+
+meshtastic_Position IndustrialModemModule::buildPosition(const ModemPosition &in)
+{
     meshtastic_Position position = meshtastic_Position_init_default;
     position.latitude_i = in.latitude_i;
     position.has_latitude_i = true;
@@ -458,9 +1322,39 @@ uint8_t IndustrialModemModule::sendPosition(const ModemPosition &in)
     position.has_altitude = true;
     position.time = in.timestamp_unix;
     position.timestamp = in.timestamp_unix;
-    position.location_source = meshtastic_Position_LocSource_LOC_MANUAL;
+    position.altitude_hae = in.altitude_hae;
+    position.has_altitude_hae = in.altitude_hae != 0;
+    position.ground_speed = in.ground_speed_mmps * 36u / 10000u;
+    position.has_ground_speed = in.ground_speed_mmps != 0;
+    position.ground_track = in.ground_track;
+    position.has_ground_track = in.ground_track != 0;
+    position.HDOP = in.hdop;
+    position.PDOP = in.pdop;
+    position.gps_accuracy = in.gps_accuracy_mm;
+    position.fix_type = in.fix_type;
+    position.location_source = (meshtastic_Position_LocSource)in.loc_source;
+    position.altitude_source = (meshtastic_Position_AltSource)in.alt_source;
     position.precision_bits = in.precision_bits ? in.precision_bits : 32;
     position.sats_in_view = in.sats_in_view;
+    position.seq_number = ++positionSeq;
+    return position;
+}
+
+uint16_t IndustrialModemModule::encodePosition(const ModemPosition &in, uint8_t *out, uint16_t cap)
+{
+    meshtastic_Position position = buildPosition(in);
+    return (uint16_t)pb_encode_to_bytes(out, cap, &meshtastic_Position_msg, &position);
+}
+
+uint8_t IndustrialModemModule::sendPosition(const ModemPosition &in)
+{
+    if (!router || !::service || !nodeDB)
+        return MODEM_ERR_BUSY;
+
+    meshtastic_Position position = buildPosition(in);
+
+    lastPosition = in;
+    havePosition = true;
 
     nodeDB->setLocalPosition(position);
 
@@ -470,14 +1364,19 @@ uint8_t IndustrialModemModule::sendPosition(const ModemPosition &in)
         self->has_position = true;
     }
 
+    uint8_t encoded[MODEM_MAX_MESH_PAYLOAD];
+    const uint16_t len = (uint16_t)pb_encode_to_bytes(encoded, sizeof(encoded), &meshtastic_Position_msg, &position);
+    if (!len)
+        return MODEM_ERR_BAD_PARAM;
+
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p)
         return MODEM_ERR_TX_QUEUE_FULL;
 
     p->to = NODENUM_BROADCAST;
     p->decoded.portnum = meshtastic_PortNum_POSITION_APP;
-    p->decoded.payload.size = pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes),
-                                                 &meshtastic_Position_msg, &position);
+    memcpy(p->decoded.payload.bytes, encoded, len);
+    p->decoded.payload.size = len;
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
 
     ::service->sendToMesh(p, RX_SRC_LOCAL, true);

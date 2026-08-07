@@ -124,6 +124,19 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     static RadioLibInterface *instance;
 
+    /** True while a packet is still waiting in the transmit queue or on the air.
+     *
+     * Lets a module tell that one of its own packets has actually left the
+     * radio, which is otherwise unobservable: completeSending() releases the
+     * packet without notifying anyone.
+     */
+    bool isTxPending(NodeNum from, PacketId id)
+    {
+        if (sendingPacket && sendingPacket->id == id && getFrom(sendingPacket) == from)
+            return true;
+        return txQueue.find(from, id);
+    }
+
     /**
      * Get the current calculated noise floor in dBm
      * Returns -120 dBm if not yet calibrated

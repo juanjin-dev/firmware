@@ -18,7 +18,7 @@
 #define MODEM_HELLO_REPLY_SIZE 17
 #define MODEM_REGION_PROFILE_SIZE 16
 #define MODEM_TX_PARAMS_SIZE 4
-#define MODEM_POSITION_SIZE 20
+#define MODEM_POSITION_SIZE 40
 #define MODEM_CONFIG_DIGEST_SIZE 16
 #define MODEM_MESH_STATUS_SIZE 32
 #define MODEM_MESH_STATE_SIZE 8
@@ -33,6 +33,8 @@
 #define MODEM_IDENTITY_REPLY_HEAD_SIZE 12
 #define MODEM_NODE_INFO_HEAD_SIZE 36
 #define MODEM_ENTER_BOOTLOADER_SIZE 4
+#define MODEM_QUERY_TELEMETRY_SIZE 8
+#define MODEM_QUERY_POSITION_SIZE 8
 
 typedef struct {
     uint16_t proto_version;
@@ -97,10 +99,18 @@ typedef struct {
     int32_t latitude_i;
     int32_t longitude_i;
     int32_t altitude_m;
+    int32_t altitude_hae;
     uint32_t timestamp_unix;
+    uint32_t ground_speed_mmps;
+    uint32_t ground_track;
+    uint16_t hdop;
+    uint16_t pdop;
+    uint16_t gps_accuracy_mm;
     uint8_t precision_bits;
     uint8_t fix_type;
     uint8_t sats_in_view;
+    uint8_t loc_source;
+    uint8_t alt_source;
     uint8_t flags;
 } ModemPosition;
 
@@ -113,12 +123,14 @@ typedef struct {
 typedef struct {
     uint8_t variant;
     const uint8_t *metrics; /* metric_count packed 6-byte records */
+    const uint8_t *utf8;
     uint8_t metric_count;
+    uint8_t text_len;
 } ModemTelemetry;
 
 typedef struct {
     uint32_t dest_node;
-    uint8_t portnum;
+    uint16_t portnum;
     uint8_t flags;
     uint8_t hop_limit;
     uint8_t channel_index;
@@ -253,6 +265,10 @@ bool modemDecodeSendBinary(const uint8_t *buf, uint16_t len, ModemSendBinary *ou
 bool modemDecodeSendText(const uint8_t *buf, uint16_t len, ModemSendText *out);
 bool modemDecodeEnterBootloader(const uint8_t *buf, uint16_t len);
 
+/// True when the bytes are well-formed UTF-8: no truncated or overlong
+/// sequences, no surrogates, nothing past U+10FFFF.
+bool modemIsValidUtf8(const uint8_t *buf, uint16_t len);
+
 /// Reads metric *index* out of a telemetry payload; false when out of range.
 bool modemTelemetryMetric(const ModemTelemetry *telemetry, uint8_t index, ModemMetric *out);
 
@@ -277,6 +293,9 @@ uint16_t modemEncodeRxText(uint8_t *buf, uint16_t cap, const ModemRxTextHeader *
                            uint16_t text_len);
 uint16_t modemEncodeNodeListHead(uint8_t *buf, uint16_t cap, uint8_t status, uint8_t count, uint8_t total);
 uint16_t modemEncodeNodeEntry(uint8_t *buf, uint16_t cap, const ModemNodeEntry *in);
+uint16_t modemEncodeQueryTelemetry(uint8_t *buf, uint16_t cap, uint32_t from_node, uint8_t variant);
+uint16_t modemEncodeQueryPosition(uint8_t *buf, uint16_t cap, uint32_t from_node);
+uint16_t modemEncodePosition(uint8_t *buf, uint16_t cap, const ModemPosition *in);
 uint16_t modemEncodeIdentityReply(uint8_t *buf, uint16_t cap, uint8_t status, const ModemIdentityInfo *in,
                                   const char *long_name, const char *short_name);
 uint16_t modemEncodeNodeInfo(uint8_t *buf, uint16_t cap, uint8_t status, const ModemNodeInfo *in, const char *long_name,
