@@ -188,7 +188,10 @@ void setupModules()
 #if ARCH_PORTDUINO
     new HostMetricsModule();
 #endif
-#if HAS_TELEMETRY
+#if defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_INDUSTRIAL_MODEM
+    industrialModemModule = new IndustrialModemModule();
+#endif
+#if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_DEVICE_TELEMETRY
     new DeviceTelemetryModule();
 #endif
 #if HAS_TELEMETRY && HAS_SENSOR && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
@@ -223,9 +226,6 @@ void setupModules()
         new SerialModule();
     }
 #endif
-#endif
-#if defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_INDUSTRIAL_MODEM
-    industrialModemModule = new IndustrialModemModule();
 #endif
 #ifdef ARCH_ESP32
     // Only run on an esp32 based device.
